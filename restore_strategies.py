@@ -1,119 +1,186 @@
-#restore_strategies.py
+# restore_strategies.py
 import asyncio
 import sys
 import os
 from datetime import datetime
+from types import SimpleNamespace
 from state_manager import load_strategies
-from utils import get_exchange  # ✅ для проверки подключения
+from utils import get_exchange
 
-# === Настройки логов ===
 LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "restore.log")
 os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "restore.log")
 
-# Добавляем текущую папку в sys.path для корректного импорта стратегий
 sys.path.append(os.path.dirname(__file__))
 
-
 def log_restore(message: str):
-    """Записывает сообщение в restore.log и выводит в консоль."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {message}"
     print(line)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as e:
-        print(f"[Ошибка записи лога]: {e}")
+        print(f"[ERROR writing restore log]: {e}")
 
+async def restore_strategies(app=None):
+    log_restore("🔁 Запуск восстановления стратегий...")
 
-async def restore_strategies(app):
-    """Восстановление всех активных стратегий при запуске."""
     try:
         data = load_strategies()
     except Exception as e:
-        log_restore(f"❌ Ошибка загрузки стратегий: {e}")
+        log_restore(f"❌ Ошибка загрузки сохранённых стратегий: {e}")
         return
 
     if not data:
-        log_restore("❌ Нет сохранённых стратегий для восстановления.")
+        log_restore("⚠️ Нет сохранённых стратегий для восстановления.")
         return
 
-    # Проверим подключение к бирже
-    try:
-        exchange = get_exchange()
-        log_restore("✅ Соединение с биржей установлено.")
-    except Exception as e:
-        log_restore(f"❌ Ошибка подключения к бирже перед восстановлением: {e}")
+    exchange = None
+    for attempt in range(1, 6):
+        try:
+            exchange = get_exchange()
+            log_restore(f"✅ Соединение с биржей установлено (попытка {attempt}).")
+            break
+        except Exception as e:
+            wait = min(60, 2 ** attempt * 2)
+            log_restore(f"⚠️ Ошибка подключения (попытка {attempt}/5): {e}. Повтор через {wait}s...")
+            await asyncio.sleep(wait)
+    if exchange is None:
+        log_restore("❌ Не удалось подключиться к бирже. Отмена.")
         return
 
-    total = sum(len(v) for v in data.values() if isinstance(v, dict))
+    total = sum(len(v) for v in data.values() if isinstance(v, list))
     restored_count = 0
-
     log_restore(f"🔁 Восстановление стратегий ({len(data)} пользователей, всего {total})...")
 
-    for chat_id, user_strategies in data.items():
-        # Приведение chat_id к числу
+    app.bot_data.setdefault("active_strategies", {})
+
+    for chat_id, strategies in data.items():
         try:
-            chat_id_int = int(chat_id)
-        except (ValueError, TypeError):
-            log_restore(f"⚠️ Пропуск некорректного chat_id: {chat_id}")
+            chat_id = int(chat_id)
+        except Exception:
             continue
 
-        if not isinstance(user_strategies, dict):
-            log_restore(f"⚠️ Некорректный формат стратегий у пользователя {chat_id}")
-            continue
+        app.bot_data["active_strategies"].setdefault(chat_id, [])
 
-        for key, info in user_strategies.items():
-            strategy = info.get("strategy") or info.get("type")
-            symbol = info.get("symbol")
-            params = info.get("params", {})
+        async def fake_reply_text(*args, **kwargs):
+            msg = ' '.join(str(a) for a in args)
+            print(f"[restore_info] {msg}")
+
+        fake_update = SimpleNamespace(
+            message=SimpleNamespace(reply_text=fake_reply_text),
+            effective_chat=SimpleNamespace(id=chat_id)
+        )
+        fake_context = SimpleNamespace(
+            bot=None,
+            application=app,
+            job_queue=getattr(app, "job_queue", None),
+            user_data={"chat_id": chat_id}
+        )
+
+        for strat in strategies:
+            strategy = strat.get("type")
+            symbol = strat.get("symbol")
+            params = strat.get("params", {})
 
             if not strategy or not symbol:
-                log_restore(f"⚠️ Пропуск некорректной записи стратегии: {info}")
                 continue
 
-            # Подготовка фиктивных объектов для вызова start_функций
-            fake_update = type("FakeUpdate", (), {
-                "message": type("msg", (), {"reply_text": lambda *_: None})(),
-                "effective_chat": type("chat", (), {"id": chat_id_int})()
-            })()
+                # НЕ добавляем в bot_data заранее — сначала пробуем запустить стратегию
+                try:
+                    st = str(strategy).lower()
+                    started = False
 
-            fake_context = type("FakeContext", (), {
-                "job_queue": app.job_queue,
-                "user_data": {"chat_id": chat_id_int}
-            })()
+                    if st in ("range", "rng", "r"):
+                        from strategies.range import start_range_strategy
+                        started = await start_range_strategy(
+                            fake_update,
+                            fake_context,
+                            symbol,
+                            params.get("amount"),
+                            params.get("low"),
+                            params.get("high"),
+                            params.get("interval"),
+                        )
 
+                    elif st == "dca":
+                        from strategies.dca import start_dca_strategy
+                        started = await start_dca_strategy(
+                            fake_update,
+                            fake_context,
+                            symbol,
+                            params.get("amount"),
+                            params.get("interval"),
+                        )
+
+                    elif st in ("percent", "pct", "percentual"):
+                        from strategies.percent import start_percent_strategy
+                        started = await start_percent_strategy(
+                            fake_update,
+                            fake_context,
+                            symbol,
+                            params.get("amount"),
+                            params.get("step"),
+                            params.get("interval"),
+                        )
+
+                    else:
+                        log_restore(f"⚠️ Неизвестный тип стратегии '{strategy}' ({symbol}) — пропуск.")
+                        continue
+
+                    if started:
+                        # Добавляем только успешные старты в bot_data и считаем в restored_count
+                        app.bot_data.setdefault("active_strategies", {})
+                        app.bot_data["active_strategies"].setdefault(chat_id_int, [])
+                        app.bot_data["active_strategies"][chat_id_int].append({
+                            "type": strategy,
+                            "symbol": symbol,
+                            "params": params,
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        restored_count += 1
+                        log_restore(f"✅ Восстановлена {strategy.upper()} для {symbol} (user {chat_id})")
+                    else:
+                        log_restore(
+                            f"⚠️ Пропуск запуска {strategy} для {symbol} (user {chat_id}) — старт отменён/неуспешен.")
+
+                except Exception as e:
+                    log_restore(f"❌ Ошибка при восстановлении {strategy} ({symbol}): {e}")
+                    continue
+
+        # --- Завершение ---
+        log_restore(f"🏁 Восстановление завершено. Успешно: {restored_count}/{total}")
+
+        # Отправляем сообщение пользователям, если восстановление прошло
+        bot = app.bot
+        for chat_id, strategies in app.bot_data.get("active_strategies", {}).items():
+            if not strategies:
+                continue
+            msg = "✅ Стратегии успешно восстановлены\n🕒 Перезапуск: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg += "\n\n📋 Активные стратегии:\n" + "\n".join(
+                f"• {s['type'].upper()} — {s['symbol']}" for s in strategies)
             try:
-                interval = params.get("interval", 5)
-                amount = params.get("amount")
-
-                # === Запуск нужной стратегии ===
-                if strategy == "percent":
-                    from strategies.percent import start_percent_strategy
-                    await start_percent_strategy(
-                        fake_update, fake_context, symbol,
-                        amount, params.get("step"), interval
-                    )
-
-                elif strategy == "range":
-                    from strategies.range import start_range_strategy
-                    await start_range_strategy(
-                        fake_update, fake_context, symbol,
-                        amount, params.get("low"), params.get("high"), interval
-                    )
-
-                elif strategy == "dca":
-                    from strategies.dca import start_dca_strategy
-                    await start_dca_strategy(
-                        fake_update, fake_context, symbol,
-                        amount, interval
-                    )
-
-                restored_count += 1
-                log_restore(f"✅ Восстановлена {strategy.upper()} для {symbol} (пользователь {chat_id})")
-
+                await bot.send_message(chat_id=chat_id, text=msg)
+                log_restore(f"📨 Сообщение о восстановлении отправлено пользователю {chat_id}")
             except Exception as e:
-                log_restore(f"⚠️ Ошибка при восстановлении {strategy} для {symbol} (пользователь {chat_id}): {e}")
+                log_restore(f"⚠️ Ошибка при уведомлении {chat_id}: {e}")
 
-    log_restore(f"🏁 Восстановление завершено. Успешно восстановлено: {restored_count}/{total}.")
+    # --- Уведомление пользователю ---
+    if restored_count > 0 and app:
+        bot = app.bot
+        for chat_id, strats in app.bot_data["active_strategies"].items():
+            if not strats:
+                continue
+            msg = "✅ Стратегии успешно восстановлены\n🕒 Перезапуск: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg += "\n\n📋 Активные стратегии:\n" + "\n".join(
+                f"• {s['type'].upper()} — {s['symbol']}" for s in strats
+            )
+            try:
+                await bot.send_message(chat_id=chat_id, text=msg)
+                log_restore(f"📨 Отправлено уведомление пользователю {chat_id}")
+            except Exception as e:
+                log_restore(f"⚠️ Ошибка отправки уведомления {chat_id}: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(restore_strategies())

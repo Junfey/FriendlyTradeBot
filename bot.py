@@ -21,6 +21,7 @@ from state_manager import load_strategies, save_strategies, add_strategy, remove
 from restore_strategies import restore_strategies
 
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,32 @@ MAX_PRICE_CHECKS = 40      # максимум запросов цены при �
 # ----------------- Start -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я торговый бот (demo).", reply_markup=get_main_menu())
+
+# ----------------- Helper -----------------
+def _user_from(update=None, context=None):
+    """Возвращает {'chat_id': <id>} безопасно из update/context."""
+    try:
+        if update is not None and hasattr(update, "effective_chat") and update.effective_chat is not None:
+            return {"chat_id": getattr(update.effective_chat, "id", "unknown")}
+    except Exception:
+        pass
+    try:
+        if context is not None and hasattr(context, "user_data") and isinstance(context.user_data, dict):
+            if "chat_id" in context.user_data:
+                return {"chat_id": context.user_data.get("chat_id")}
+    except Exception:
+        pass
+    try:
+        if context is not None and hasattr(context, "bot") and hasattr(context.bot, "id"):
+            return {"chat_id": getattr(context.bot, "id", "unknown")}
+    except Exception:
+        pass
+    return {"chat_id": "unknown"}
+# -----------------
+
+
+
+
 
 
 # ----------------- Price (CLI) -----------------
@@ -115,12 +142,26 @@ async def list_major_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------- Список стратегий -----------------
 async def list_strategies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = get_jobs(context.user_data) or {}
-    if not jobs:
+    chat_id = update.effective_chat.id
+
+    # Берем из общего хранилища, где restore_strategies записывает активные стратегии
+    all_active = context.application.bot_data.get("active_strategies", {})
+
+    user_strats = all_active.get(chat_id, [])
+
+    if not user_strats:
         await update.message.reply_text("⚠️ Нет запущенных стратегий.")
         return
-    text = "📊 Активные стратегии:\n" + "\n".join(jobs.keys())
-    await update.message.reply_text(text)
+
+    lines = []
+    for s in user_strats:
+        lines.append(
+            f"📊 {s['symbol']}: шаг {s.get('params', {}).get('step', '?')}% / "
+            f"объём {s.get('params', {}).get('amount', '?')}"
+        )
+
+    await update.message.reply_text("📋 Активные стратегии:\n" + "\n".join(lines))
+
 
 
 # ----------------- Стоп всех стратегий -----------------
@@ -144,26 +185,33 @@ async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BUY_AMOUNT
 
 async def buy_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from utils import normalize_symbol, place_market_order_safe
+
     try:
         amount = float(update.message.text.strip())
     except Exception:
         await update.message.reply_text("❌ Неверный формат суммы. Операция отменена.", reply_markup=get_main_menu())
         return ConversationHandler.END
 
-    symbol = context.user_data.get("buy_symbol")
+    symbol = context.user_data.get("buy_symbol", "").strip().upper()
     if not symbol:
         await update.message.reply_text("❌ Валютная пара не указана.", reply_markup=get_main_menu())
         return ConversationHandler.END
 
-    base, quote = symbol.split("/")  # например BTC/USDT
+    # BTC -> BTC/USDT (если нужно)
+    symbol = normalize_symbol(symbol)
+    base, quote = symbol.split("/")
+
     try:
         balance = await asyncio.to_thread(sync_get_balance)
         quote_balance = float(balance.get(quote, 0))
 
-        # узнаём цену, чтобы пересчитать сколько USDT нужно
         price = await asyncio.to_thread(sync_get_price, symbol)
-        required_quote = price * amount
+        if not price:
+            await update.message.reply_text(f"❌ Пара {symbol} не поддерживается.", reply_markup=get_main_menu())
+            return ConversationHandler.END
 
+        required_quote = price * amount
         if quote_balance < required_quote:
             await update.message.reply_text(
                 f"❌ Недостаточно средств: {quote} баланс = {quote_balance}, нужно ≈ {required_quote:.2f}",
@@ -171,7 +219,8 @@ async def buy_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        await asyncio.to_thread(sync_place_market_order, symbol, "buy", amount)
+        # ⬇️ ВАЖНО: дожидаемся асинхронного размещения ордера
+        await place_market_order_safe(symbol, "buy", amount)
         await update.message.reply_text(f"✅ Куплено {amount} {symbol}", reply_markup=get_main_menu())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при покупке: {e}", reply_markup=get_main_menu())
@@ -188,22 +237,25 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SELL_AMOUNT
 
 async def sell_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from utils import normalize_symbol, place_market_order_safe
+
     try:
         amount = float(update.message.text.strip())
     except Exception:
         await update.message.reply_text("❌ Неверный формат суммы. Операция отменена.", reply_markup=get_main_menu())
         return ConversationHandler.END
 
-    symbol = context.user_data.get("sell_symbol")
+    symbol = context.user_data.get("sell_symbol", "").strip().upper()
     if not symbol:
         await update.message.reply_text("❌ Валютная пара не указана.", reply_markup=get_main_menu())
         return ConversationHandler.END
 
-    base, quote = symbol.split("/")  # например BTC/USDT
+    symbol = normalize_symbol(symbol)
+    base, quote = symbol.split("/")
+
     try:
         balance = await asyncio.to_thread(sync_get_balance)
         base_balance = float(balance.get(base, 0))
-
         if base_balance < amount:
             await update.message.reply_text(
                 f"❌ Недостаточно средств: {base} баланс = {base_balance}, нужно {amount}",
@@ -211,12 +263,12 @@ async def sell_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        await asyncio.to_thread(sync_place_market_order, symbol, "sell", amount)
+        # ⬇️ ВАЖНО: не через to_thread — это async функция
+        await place_market_order_safe(symbol, "sell", amount)
         await update.message.reply_text(f"✅ Продано {amount} {symbol}", reply_markup=get_main_menu())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при продаже: {e}", reply_markup=get_main_menu())
     return ConversationHandler.END
-
 
 # ----------------- Percent / DCA / Range (Conversation flows) -----------------
 
@@ -362,10 +414,6 @@ async def range_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Range-стратегия запущена.", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-    await start_range_strategy(update, context, symbol, amount, min_val, range_max_val)
-    await update.message.reply_text("✅ Range-стратегия запущена.", reply_markup=get_main_menu())
-    return ConversationHandler.END
-
 
 # ----------------- STOP callback -----------------
 async def stop_strategy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,6 +554,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------- Main -----------------
 def main():
+    logger.info("🚀 Запуск Telegram-бота...")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Команды
@@ -513,13 +563,9 @@ def main():
     app.add_handler(CommandHandler("list_strategies", list_strategies))
     app.add_handler(CommandHandler("stop_grid", stop_all))
     app.add_handler(CommandHandler("price", check_price_cli))
-
-    # STOP кнопки (inline)
     app.add_handler(CallbackQueryHandler(stop_strategy_callback, pattern="^STOP:"))
 
     # ConversationHandlers
-
-    # Price (интерактивная проверка)
     conv_price = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔍 Проверить цену$"), price_symbol)],
         states={PRICE_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, price_run)]},
@@ -529,7 +575,6 @@ def main():
     )
     app.add_handler(conv_price)
 
-    # Percent
     conv_percent = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Percent$"), percent_symbol)],
         states={
@@ -544,7 +589,6 @@ def main():
     )
     app.add_handler(conv_percent)
 
-    # DCA
     conv_dca = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^DCA$"), dca_symbol)],
         states={
@@ -558,7 +602,6 @@ def main():
     )
     app.add_handler(conv_dca)
 
-    # Range
     conv_range = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Range$"), range_symbol)],
         states={
@@ -574,7 +617,6 @@ def main():
     )
     app.add_handler(conv_range)
 
-    # Buy
     conv_buy = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💵 Купить$"), buy_symbol)],
         states={
@@ -587,7 +629,6 @@ def main():
     )
     app.add_handler(conv_buy)
 
-    # Sell
     conv_sell = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💰 Продать$"), sell_symbol)],
         states={
@@ -604,16 +645,51 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Bot started")
 
-    # ==== восстановление стратегий перед запуском polling'а ====
-    # restore_strategies — асинхронная функция, вызываем её безопасно (внешний sync-контекст)
-    try:
-        import asyncio as _asyncio
-        _asyncio.run(restore_strategies(app))
-    except Exception as e:
-        logger.exception("Ошибка при восстановлении стратегий: %s", e)
+    # --- Асинхронное восстановление стратегий при запуске ---
+    # --- Асинхронное восстановление стратегий при запуске ---
+    async def on_startup(app):
+        logger.info("🔁 Восстановление стратегий при старте...")
+        from restore_strategies import restore_strategies
+        from datetime import datetime
 
-    # Запускаем бота (внутри run_polling приложение само инициализирует и запускает loop)
-    app.run_polling()
+        # Восстанавливаем
+        await restore_strategies(app)
+        logger.info("✅ Стратегии восстановлены.")
+
+        bot = app.bot
+        restored = app.bot_data.get("active_strategies", {})
+
+        # Если ничего не восстановлено
+        if not restored:
+            logger.info("⚠️ Нет сохранённых стратегий для уведомления.")
+            return
+
+        # Формируем время
+        time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Рассылаем уведомления пользователям
+        for chat_id, strategies in restored.items():
+            if not strategies:
+                continue
+
+            msg = (
+                    f"✅ Стратегии успешно восстановлены\n"
+                    f"🕒 Перезапуск: {time_now}\n\n"
+                    f"📋 Активные стратегии:\n"
+                    + "\n".join(f"• {s['type'].upper()} — {s['symbol']}" for s in strategies)
+            )
+
+            try:
+                await bot.send_message(chat_id=chat_id, text=msg)
+            except Exception as e:
+                logger.warning(f"Не удалось отправить уведомление пользователю {chat_id}: {e}")
+
+    # Привязываем хук
+    app.post_init = on_startup
+
+    # 🚀 Запуск polling
+    logger.info("✅ Telegram-бот запущен. Ожидаю команды...")
+    app.run_polling()  # теперь без close_loop=False
 
 
 if __name__ == "__main__":

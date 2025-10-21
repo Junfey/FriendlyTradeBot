@@ -88,10 +88,6 @@ def get_exchange(force_reconnect: bool = False):
 
 
 
-# --- Инициализация соединения ---
-exchange = get_exchange()
-
-
 async def reconnect_exchange(delay: int = 10):
     """
     Асинхронное и безопасное переподключение к бирже.
@@ -111,8 +107,6 @@ async def reconnect_exchange(delay: int = 10):
 
 
 
-# --- Инициализация соединения ---
-exchange = get_exchange()
 
 
 async def reconnect_exchange(delay: int = 10):
@@ -136,11 +130,13 @@ async def reconnect_exchange(delay: int = 10):
 # --- Безопасное добавление стратегии ---
 def safe_add_strategy(update_or_user, strategy_type, symbol, params):
     """
-    Безопасно добавляет стратегию, исключая дубликаты.
-    Поддерживает как update (из Telegram), так и user_data (словарь).
+    Безопасно добавляет стратегию (через state_manager),
+    проверяя дубликаты и сохраняя в общем формате.
     """
+    from state_manager import load_strategies, save_strategies
+    import datetime
+
     try:
-        # Определяем chat_id
         if hasattr(update_or_user, "effective_chat"):
             chat_id = str(update_or_user.effective_chat.id)
         elif isinstance(update_or_user, dict):
@@ -148,41 +144,37 @@ def safe_add_strategy(update_or_user, strategy_type, symbol, params):
         else:
             chat_id = "unknown"
 
-        all_data = load_strategies()  # общий словарь JSON
-
-        # создаем список стратегий, если его еще нет
+        all_data = load_strategies()
         if chat_id not in all_data:
-            all_data[chat_id] = []
+            all_data[chat_id] = {}
 
-        strategies = all_data[chat_id]
-
-        # Проверяем, нет ли уже такой стратегии с тем же символом и типом
+        # Проверяем дубликаты
         exists = any(
-            s.get("type") == strategy_type and s.get("symbol") == symbol
-            for s in strategies
+            s.get("symbol") == symbol and s.get("type") == strategy_type
+            for s in all_data[chat_id].values()
         )
         if exists:
             logger.warning(f"[safe_add_strategy] ⚠️ Стратегия {strategy_type}:{symbol} уже существует — пропуск.")
             return False
 
-        # Создаём новую запись
-        new_strategy = {
+        # Генерация ID
+        strategy_id = f"{strategy_type}_{symbol}_{datetime.datetime.now().strftime('%Y%m%dT%H%M%S%f')}"
+
+        all_data[chat_id][strategy_id] = {
             "type": strategy_type,
             "symbol": symbol,
-            "params": params
+            "parameters": params,
+            "created_at": datetime.datetime.now().isoformat()
         }
 
-        strategies.append(new_strategy)
-
-        # Сохраняем всё обратно в файл
         save_strategies(all_data)
-
-        logger.info(f"[safe_add_strategy] ✅ Добавлена стратегия {strategy_type}:{symbol} для пользователя {chat_id}")
+        logger.info(f"[safe_add_strategy] ✅ Добавлена стратегия {strategy_type}:{symbol} ({strategy_id})")
         return True
 
     except Exception as e:
         logger.exception(f"[safe_add_strategy] ❌ Ошибка добавления стратегии: {e}")
         return False
+
 
 
 
@@ -298,3 +290,6 @@ async def place_market_order_safe(symbol: str, side: str, amount: float):
         except Exception as e:
             logger.error(f"place_market_order error: {e}")
             raise
+
+# --- Инициализация соединения ---
+exchange = get_exchange()
