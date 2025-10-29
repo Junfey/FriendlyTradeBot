@@ -5,7 +5,9 @@ import ccxt
 import time
 from typing import Dict, Any, Tuple, List
 from state_manager import load_strategies, save_strategies
-from config import EXCHANGE_API_KEY, EXCHANGE_API_SECRET, EXCHANGE_NAME, USE_TESTNET
+from settings import settings, EXCHANGE_NAME, USE_TESTNET
+from load_manager import record_api_call
+from constants import MIN_ORDER_USD
 
 exchange = None  # глобальная переменная
 
@@ -26,7 +28,6 @@ import ccxt
 import time
 from typing import Dict, Any, Tuple, List
 from state_manager import load_strategies, save_strategies
-from config import EXCHANGE_API_KEY, EXCHANGE_API_SECRET, EXCHANGE_NAME, USE_TESTNET
 
 exchange = None
 logger = logging.getLogger(__name__)
@@ -57,8 +58,8 @@ def get_exchange(force_reconnect: bool = False):
 
             exchange_class = getattr(ccxt, EXCHANGE_NAME)
             exchange = exchange_class({
-                "apiKey": EXCHANGE_API_KEY,
-                "secret": EXCHANGE_API_SECRET,
+                "apiKey": settings.api_key,
+                "secret": settings.api_secret,
                 "enableRateLimit": True,
                 "options": {
                     "defaultType": "spot",
@@ -196,6 +197,7 @@ def normalize_symbol(symbol: str) -> str:
 # --- Получение баланса ---
 def get_balance() -> Dict[str, float]:
     try:
+        record_api_call()
         bal = exchange.fetch_balance()
         totals = bal.get("total", bal)
         result = {
@@ -212,6 +214,7 @@ def get_balance() -> Dict[str, float]:
 # --- Получение цены ---
 def get_price(symbol: str):
     try:
+        record_api_call()
         if symbol not in exchange.symbols:
             logger.warning(f"❌ Пара {symbol} не поддерживается")
             return None
@@ -284,6 +287,7 @@ async def place_market_order_safe(symbol: str, side: str, amount: float):
             raise Exception(msg)
 
         try:
+            record_api_call()
             order = await asyncio.to_thread(exchange.create_market_order, symbol, side, amount)
             logger.info(f"✅ Market order {side} {amount} {symbol} executed.")
             return order

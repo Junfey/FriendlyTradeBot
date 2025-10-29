@@ -2,7 +2,7 @@
 import ccxt
 import logging
 import os
-from config import EXCHANGE_API_KEY, EXCHANGE_API_SECRET
+from settings import settings
 
 # Временно устанавливаем уровень логов для отладки
 logging.basicConfig(level=logging.INFO)
@@ -14,8 +14,8 @@ def check_connection():
 
         # Создаем объект биржи
         exchange = ccxt.binance({
-            "apiKey": EXCHANGE_API_KEY,
-            "secret": EXCHANGE_API_SECRET,
+            "apiKey": settings.api_key,
+            "secret": settings.api_secret,
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",

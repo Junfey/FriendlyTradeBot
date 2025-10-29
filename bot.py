@@ -1,4 +1,7 @@
 # bot.py
+from logging_config import setup_logging
+setup_logging()
+
 import logging
 import asyncio
 from typing import Dict, Any, List, Tuple
@@ -10,15 +13,17 @@ from telegram.ext import (
     CallbackQueryHandler, filters
 )
 
-from config import TELEGRAM_TOKEN
+from decimal import Decimal, InvalidOperation
+from settings import TELEGRAM_TOKEN
 from menus import get_main_menu, get_strategies_menu, get_back_menu
 from state import stop_all_jobs, get_jobs, remove_job
 from strategies.percent import start_percent_strategy
 from strategies.dca import start_dca_strategy
 from strategies.range import start_range_strategy
 from utils import get_price as sync_get_price, get_balance as sync_get_balance, place_market_order_safe as sync_place_market_order
-from state_manager import load_strategies, save_strategies, add_strategy, remove_strategy
+from state_manager import load_strategies, save_strategies
 from restore_strategies import restore_strategies
+from constants import MIN_ORDER_USD, MIN_USD_VALUE, MAX_PRICE_CHECKS, MAJOR_ASSETS
 
 
 
@@ -32,11 +37,6 @@ RANGE_SYMBOL, RANGE_AMOUNT, RANGE_MIN, RANGE_MAX, RANGE_INTERVAL = range(7, 12)
 BUY_SYMBOL, BUY_AMOUNT = range(12, 14)
 SELL_SYMBOL, SELL_AMOUNT = range(14, 16)
 PRICE_SYMBOL = 16
-
-# Настройки фильтрации баланса
-MAJOR_ASSETS = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LTC", "DOT", "TRX", "MATIC"]
-MIN_USD_VALUE = 5.0        # минимальная стоимость позиции в USDT, чтобы её показывать (если рассчитываем цену)
-MAX_PRICE_CHECKS = 40      # максимум запросов цены при фильтрации баланса (чтобы не делать 100+ запросов)
 
 # ----------------- Start -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,100 +175,164 @@ async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------- Покупка / Продажа -----------------
+
+# ----------------- Покупка -----------------
 async def buy_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите валютную пару (например BTC/USDT):", reply_markup=get_back_menu())
+    await update.message.reply_text("Введите валютную пару (например BTC/USDT или просто BTC):", reply_markup=get_back_menu())
     return BUY_SYMBOL
 
 async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # нормализуем хранение пары как верхний регистр без лишних пробелов
     context.user_data["buy_symbol"] = update.message.text.strip().upper()
-    await update.message.reply_text("Введите сумму:", reply_markup=get_back_menu())
+    await update.message.reply_text("Введите сумму БАЗОВОЙ валюты (например 0.001 для BTC):", reply_markup=get_back_menu())
     return BUY_AMOUNT
 
 async def buy_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from utils import normalize_symbol, place_market_order_safe
 
-    try:
-        amount = float(update.message.text.strip())
-    except Exception:
-        await update.message.reply_text("❌ Неверный формат суммы. Операция отменена.", reply_markup=get_main_menu())
+    # ---- идемпотентность (защита от двойного клика) ----
+    if context.user_data.get("op_lock"):
+        await update.message.reply_text("⏳ Предыдущая операция ещё обрабатывается. Подождите пару секунд.", reply_markup=get_main_menu())
         return ConversationHandler.END
-
-    symbol = context.user_data.get("buy_symbol", "").strip().upper()
-    if not symbol:
-        await update.message.reply_text("❌ Валютная пара не указана.", reply_markup=get_main_menu())
-        return ConversationHandler.END
-
-    # BTC -> BTC/USDT (если нужно)
-    symbol = normalize_symbol(symbol)
-    base, quote = symbol.split("/")
+    context.user_data["op_lock"] = True
 
     try:
-        balance = await asyncio.to_thread(sync_get_balance)
-        quote_balance = float(balance.get(quote, 0))
+        # Парс суммы
+        try:
+            amount = Decimal(update.message.text.strip())
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            await update.message.reply_text("❌ Неверная сумма. Введите положительное число.", reply_markup=get_main_menu())
+            return ConversationHandler.END
 
+        # Символ
+        raw_symbol = (context.user_data.get("buy_symbol") or "").strip().upper()
+        if not raw_symbol:
+            await update.message.reply_text("❌ Валютная пара не указана.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        # BTC -> BTC/USDT
+        symbol = normalize_symbol(raw_symbol)
+        if "/" not in symbol:
+            await update.message.reply_text("❌ Неверная пара. Пример: BTC/USDT", reply_markup=get_main_menu())
+            return ConversationHandler.END
+        base, quote = symbol.split("/")
+
+        # Цена и баланс
         price = await asyncio.to_thread(sync_get_price, symbol)
         if not price:
             await update.message.reply_text(f"❌ Пара {symbol} не поддерживается.", reply_markup=get_main_menu())
             return ConversationHandler.END
 
-        required_quote = price * amount
-        if quote_balance < required_quote:
+        balance = await asyncio.to_thread(sync_get_balance)
+        quote_balance = Decimal(str(balance.get(quote, 0)))
+
+        # Проверка минимального ордера и достаточности средств
+        order_value_usd = Decimal(str(price)) * amount  # покупаем amount базовой валюты
+        if order_value_usd < MIN_ORDER_USD:
             await update.message.reply_text(
-                f"❌ Недостаточно средств: {quote} баланс = {quote_balance}, нужно ≈ {required_quote:.2f}",
+                f"⚠️ Слишком маленький ордер: ≈ {order_value_usd:.2f} USDT < {MIN_ORDER_USD} USDT.",
                 reply_markup=get_main_menu()
             )
             return ConversationHandler.END
 
-        # ⬇️ ВАЖНО: дожидаемся асинхронного размещения ордера
-        await place_market_order_safe(symbol, "buy", amount)
-        await update.message.reply_text(f"✅ Куплено {amount} {symbol}", reply_markup=get_main_menu())
+        required_quote = order_value_usd  # в USDT (или другой quote)
+        if quote_balance < required_quote:
+            await update.message.reply_text(
+                f"❌ Недостаточно {quote}: баланс {quote_balance:.4f}, требуется ≈ {required_quote:.2f}.",
+                reply_markup=get_main_menu()
+            )
+            return ConversationHandler.END
+
+        # Размещаем ордер (amount — в базовой валюте)
+        await place_market_order_safe(symbol, "buy", float(amount))
+        await update.message.reply_text(f"✅ Куплено {amount.normalize()} {base} по рынку {symbol}.", reply_markup=get_main_menu())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при покупке: {e}", reply_markup=get_main_menu())
+    finally:
+        context.user_data["op_lock"] = False
+
     return ConversationHandler.END
 
 
+
+# ----------------- Продажа -----------------
 async def sell_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите валютную пару (например BTC/USDT):", reply_markup=get_back_menu())
+    await update.message.reply_text("Введите валютную пару (например BTC/USDT или просто BTC):", reply_markup=get_back_menu())
     return SELL_SYMBOL
 
 async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sell_symbol"] = update.message.text.strip().upper()
-    await update.message.reply_text("Введите сумму:", reply_markup=get_back_menu())
+    await update.message.reply_text("Введите сумму БАЗОВОЙ валюты (например 0.001 BTC):", reply_markup=get_back_menu())
     return SELL_AMOUNT
 
 async def sell_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from utils import normalize_symbol, place_market_order_safe
 
-    try:
-        amount = float(update.message.text.strip())
-    except Exception:
-        await update.message.reply_text("❌ Неверный формат суммы. Операция отменена.", reply_markup=get_main_menu())
+    # ---- идемпотентность ----
+    if context.user_data.get("op_lock"):
+        await update.message.reply_text("⏳ Предыдущая операция ещё обрабатывается. Подождите пару секунд.", reply_markup=get_main_menu())
         return ConversationHandler.END
-
-    symbol = context.user_data.get("sell_symbol", "").strip().upper()
-    if not symbol:
-        await update.message.reply_text("❌ Валютная пара не указана.", reply_markup=get_main_menu())
-        return ConversationHandler.END
-
-    symbol = normalize_symbol(symbol)
-    base, quote = symbol.split("/")
+    context.user_data["op_lock"] = True
 
     try:
+        # Парс суммы
+        try:
+            amount = Decimal(update.message.text.strip())
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            await update.message.reply_text("❌ Неверная сумма. Введите положительное число.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        # Символ
+        raw_symbol = (context.user_data.get("sell_symbol") or "").strip().upper()
+        if not raw_symbol:
+            await update.message.reply_text("❌ Валютная пара не указана.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        symbol = normalize_symbol(raw_symbol)
+        if "/" not in symbol:
+            await update.message.reply_text("❌ Неверная пара. Пример: BTC/USDT", reply_markup=get_main_menu())
+            return ConversationHandler.END
+        base, quote = symbol.split("/")
+
+        # Цена и баланс
+        price = await asyncio.to_thread(sync_get_price, symbol)
+        if not price:
+            await update.message.reply_text(f"❌ Пара {symbol} не поддерживается.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
         balance = await asyncio.to_thread(sync_get_balance)
-        base_balance = float(balance.get(base, 0))
+        base_balance = Decimal(str(balance.get(base, 0)))
+
         if base_balance < amount:
             await update.message.reply_text(
-                f"❌ Недостаточно средств: {base} баланс = {base_balance}, нужно {amount}",
+                f"❌ Недостаточно {base}: баланс {base_balance.normalize()}, требуется {amount.normalize()}.",
                 reply_markup=get_main_menu()
             )
             return ConversationHandler.END
 
-        # ⬇️ ВАЖНО: не через to_thread — это async функция
-        await place_market_order_safe(symbol, "sell", amount)
-        await update.message.reply_text(f"✅ Продано {amount} {symbol}", reply_markup=get_main_menu())
+        # Проверка минимального ордера (в USD-экв.)
+        order_value_usd = Decimal(str(price)) * amount
+        if order_value_usd < MIN_ORDER_USD:
+            await update.message.reply_text(
+                f"⚠️ Слишком маленький ордер: ≈ {order_value_usd:.2f} USDT < {MIN_ORDER_USD} USDT.",
+                reply_markup=get_main_menu()
+            )
+            return ConversationHandler.END
+
+        # Размещаем ордер (amount — в базовой валюте)
+        await place_market_order_safe(symbol, "sell", float(amount))
+        await update.message.reply_text(f"✅ Продано {amount.normalize()} {base} по рынку {symbol}.", reply_markup=get_main_menu())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при продаже: {e}", reply_markup=get_main_menu())
+    finally:
+        context.user_data["op_lock"] = False
+
     return ConversationHandler.END
+
 
 # ----------------- Percent / DCA / Range (Conversation flows) -----------------
 
@@ -302,14 +366,21 @@ async def percent_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def percent_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        interval = int(update.message.text.strip())
+        # поддержка дробных и запятых
+        interval = float(update.message.text.strip().replace(",", "."))
+        if interval <= 0:
+            raise ValueError
     except Exception:
-        await update.message.reply_text("❌ Неверный формат интервала.", reply_markup=get_main_menu())
+        await update.message.reply_text(
+            "❌ Неверный формат интервала. Введите положительное число (например 1 или 0.5).",
+            reply_markup=get_main_menu()
+        )
         return ConversationHandler.END
 
     symbol = context.user_data.get("percent_symbol")
     amount = context.user_data.get("percent_amount")
     step = context.user_data.get("percent_step")
+
     if not symbol or amount is None or step is None:
         await update.message.reply_text("❌ Ошибка параметров.", reply_markup=get_main_menu())
         return ConversationHandler.END
@@ -319,15 +390,19 @@ async def percent_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Percent-стратегия запущена.", reply_markup=get_main_menu())
     return ConversationHandler.END
 
+
+# ----------------- DCA -----------------
 # ----------------- DCA -----------------
 async def dca_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите валютную пару (например ETH/USDT):", reply_markup=get_back_menu())
     return DCA_SYMBOL
 
+
 async def dca_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["dca_symbol"] = update.message.text.strip().upper()
     await update.message.reply_text("Введите сумму (например 0.002):", reply_markup=get_back_menu())
     return DCA_AMOUNT
+
 
 async def dca_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -338,15 +413,22 @@ async def dca_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите интервал в минутах:", reply_markup=get_back_menu())
     return DCA_INTERVAL
 
-async def dca_run(update, context):
+
+async def dca_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        interval = int(update.message.text.strip())
+        interval = float(update.message.text.strip().replace(",", "."))
+        if interval <= 0:
+            raise ValueError
     except Exception:
-        await update.message.reply_text("❌ Неверный формат интервала.", reply_markup=get_main_menu())
+        await update.message.reply_text(
+            "❌ Неверный формат интервала. Введите положительное число (например 1 или 0.5).",
+            reply_markup=get_main_menu()
+        )
         return ConversationHandler.END
 
     symbol = context.user_data.get("dca_symbol")
     amount = context.user_data.get("dca_amount")
+
     if not symbol or amount is None:
         await update.message.reply_text("❌ Ошибка параметров.", reply_markup=get_main_menu())
         return ConversationHandler.END
@@ -355,6 +437,8 @@ async def dca_run(update, context):
     if started:
         await update.message.reply_text("✅ DCA-стратегия запущена.", reply_markup=get_main_menu())
     return ConversationHandler.END
+
+
 
 
 # ----------------- Range -----------------
@@ -396,15 +480,21 @@ async def range_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def range_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        interval = int(update.message.text.strip())
+        interval = float(update.message.text.strip().replace(",", "."))
+        if interval <= 0:
+            raise ValueError
     except Exception:
-        await update.message.reply_text("❌ Неверный формат интервала.", reply_markup=get_main_menu())
+        await update.message.reply_text(
+            "❌ Неверный формат интервала. Введите положительное число (например 1 или 0.5).",
+            reply_markup=get_main_menu()
+        )
         return ConversationHandler.END
 
     symbol = context.user_data.get("range_symbol")
     amount = context.user_data.get("range_amount")
     min_val = context.user_data.get("range_min")
     max_val = context.user_data.get("range_max")
+
     if not symbol or amount is None or min_val is None or max_val is None:
         await update.message.reply_text("❌ Ошибка параметров.", reply_markup=get_main_menu())
         return ConversationHandler.END

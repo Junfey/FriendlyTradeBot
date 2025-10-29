@@ -1,12 +1,12 @@
 import ccxt
-from config import EXCHANGE_API_KEY, EXCHANGE_API_SECRET, EXCHANGE_NAME, USE_TESTNET
+from settings import settings, EXCHANGE_NAME, USE_TESTNET
 
 def create_exchange():
     """Создаёт объект биржи CCXT с учётом тестнета и безопасных параметров."""
     exchange_class = getattr(ccxt, EXCHANGE_NAME)
     exchange = exchange_class({
-        "apiKey": EXCHANGE_API_KEY,
-        "secret": EXCHANGE_API_SECRET,
+        "apiKey": settings.api_key,
+        "secret": settings.api_secret,
         "enableRateLimit": True,
         "options": {
             "adjustForTimeDifference": True,

@@ -1,11 +1,13 @@
 # strategies/percent.py
 import asyncio
+from strategies.percent_config import PercentConfig
 from decimal import Decimal, InvalidOperation
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from utils import get_price, place_market_order_safe, has_enough_balance, safe_add_strategy
 from state import make_job_key, add_job, get_jobs, remove_job
 from menus import get_main_menu
 from decorators import resilient_strategy
+from constants import MIN_ORDER_USD
 import logging
 
 logger = logging.getLogger(__name__)
@@ -75,38 +77,88 @@ async def percent_job(context):
     except Exception as e:
         logger.warning(f"Не удалось отправить сообщение в percent_job: {e}")
 
+    # === Адаптивная корректировка интервала ===
+    from load_manager import adaptive_delay
+    job.interval = await adaptive_delay(job.interval)
+
 
 async def start_percent_strategy(update, context, symbol, amount, step, interval):
     """Запуск стратегии Percent с пользовательским интервалом (в минутах).
        Возвращает True при успешном старте, False если запуск отменён."""
-    job_key = make_job_key("percent", symbol, amount=amount, step=step, interval=interval)
-    if job_key in get_jobs(context.user_data):
-        await update.message.reply_text(f"⚠️ Уже запущено: {job_key}", reply_markup=get_main_menu())
+
+    from load_manager import register_strategy  # импорт функции регистрации
+
+    chat_id = update.effective_chat.id
+
+    # === 1️⃣ Проверяем, что введённые параметры валидны ===
+    try:
+        cfg = PercentConfig(
+            symbol=symbol,
+            amount=amount,
+            step=step,
+            interval=interval
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Неверные параметры стратегии: {e}",
+            reply_markup=get_main_menu()
+        )
         return False
 
+    # === 2️⃣ Создаём уникальный ключ стратегии ===
+    job_key = make_job_key("percent", symbol, amount=amount, step=step, interval=interval)
+
+    # === 3️⃣ Проверяем, не запущена ли уже стратегия с таким ключом ===
+    if job_key in get_jobs(context.user_data):
+        await update.message.reply_text(
+            f"⚠️ Уже запущено: {job_key}",
+            reply_markup=get_main_menu()
+        )
+        return False
+
+    # === 4️⃣ Регистрируем стратегию в глобальном списке ===
+    # (в JSON и лимитах, через load_manager)
+    if not register_strategy(chat_id, job_key):
+        await update.message.reply_text(
+            "⚠️ Лимит активных стратегий достигнут.",
+            reply_markup=get_main_menu()
+        )
+        return False
+
+    # === 5️⃣ Проверяем баланс перед стартом ===
     ok, reason = await asyncio.to_thread(has_enough_balance, symbol, "buy", amount)
     if not ok:
-        await update.message.reply_text(f"❌ Запуск невозможен: {reason}", reply_markup=get_main_menu())
+        await update.message.reply_text(
+            f"❌ Запуск невозможен: {reason}",
+            reply_markup=get_main_menu()
+        )
         return False
 
+    # === 6️⃣ Добавляем задачу в планировщик ===
     job = context.job_queue.run_repeating(
-        percent_job, interval * 60,  # минуты -> секунды
-        chat_id=update.effective_chat.id,
-        name=job_key, data={"symbol": symbol, "amount": amount, "step": step}
+        percent_job,
+        interval * 60,  # минуты → секунды
+        chat_id=chat_id,
+        name=job_key,
+        data={"symbol": symbol, "amount": amount, "step": step}
     )
     add_job(context.user_data, job_key, job)
 
-    # ✅ Сохраняем в persistent state
+    # === 7️⃣ Сохраняем стратегию в persistent state ===
     safe_add_strategy(update, "percent", symbol, {
         "amount": amount,
         "step": step,
         "interval": interval
     })
 
+    # === 8️⃣ Сообщаем пользователю ===
     await update.message.reply_text(
         f"🚀 Percent-бот запущен для {symbol}\n"
         f"Шаг: {step}% / Объём: {amount}\nИнтервал: {interval} мин.",
         reply_markup=get_main_menu()
     )
+
+    logger.info(f"✅ Запущена Percent-стратегия {job_key} для {chat_id}")
     return True
+
 
